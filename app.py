@@ -179,14 +179,15 @@ def upload_resumable_chunks(upload_url: str, file_path: str, chunk_size: int = R
             end = offset + len(chunk) - 1
             content_range = f"bytes {start}-{end}/{total_size}"
             headers = {
-                "Content-Type": "application/octet-stream",  # server expects raw bytes for chunk
+                "Content-Type": "application/octet-stream",
                 "Content-Length": str(len(chunk)),
                 "X-Goog-Upload-Protocol": "resumable",
                 "X-Goog-Upload-Command": "upload",
                 "X-Goog-Upload-Header-Content-Length": str(total_size),
-                "X-Goog-Upload-Header-Content-Type": headers_get_mime := "application/octet-stream",
+                "X-Goog-Upload-Header-Content-Type": "application/octet-stream",
                 "Content-Range": content_range,
             }
+
             try:
                 # We use PUT for chunk upload (Google supports PUT with Content-Range)
                 resp = make_request_with_retry("PUT", upload_url, headers=headers, data=chunk)
