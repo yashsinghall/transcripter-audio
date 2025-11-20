@@ -596,36 +596,36 @@ if start_button:
     
 # Close theme wrapper
 st.markdown("</div>", unsafe_allow_html=True)
-# app.py — PART 4/4
+# app.py — PART 4/4 (PATCHED & FIXED)
 # Final transcript rendering: expandable panels, search/filters, colored speaker view, pagination & download.
 
-# --- Final Transcript Viewer Helpers ---
+import html  # required for safe escaping
 
 def _wrap_line_html(line: str) -> str:
     """Return HTML-wrapped line with speaker color classes when label is present."""
     clean = line.strip()
+
     # detect speaker label at line start (case-insensitive)
-    if clean.lower().startswith("speaker 1:"):
-        # keep label and rest separated for styling
-        return f"<div class='speaker1'>{st.escape(clean)}</div>"
-    if clean.lower().startswith("speaker 2:"):
-        return f"<div class='speaker2'>{st.escape(clean)}</div>"
+    lc = clean.lower()
+    if lc.startswith("speaker 1:"):
+        return f"<div class='speaker1'>{html.escape(clean)}</div>"
+    if lc.startswith("speaker 2:"):
+        return f"<div class='speaker2'>{html.escape(clean)}</div>"
+
     # fallback
-    return f"<div class='other-speech'>{st.escape(clean)}</div>"
+    return f"<div class='other-speech'>{html.escape(clean)}</div>"
 
 def colorize_transcript_html(text: str) -> str:
-    """
-    Convert transcript text into HTML block with colored speaker lines and safe escaping.
-    Uses the CSS classes defined earlier.
-    """
+    """Convert transcript text into HTML block with colored speaker lines and escaping."""
     if not isinstance(text, str) or not text.strip():
         return "<div class='other-speech'>No transcript</div>"
+
     lines = text.splitlines()
-    wrapped = [_wrap_line_html(ln) for ln in lines if ln.strip() != ""]
-    # join with small spacing
+    wrapped = [_wrap_line_html(ln) for ln in lines if ln.strip()]
     return "<div>" + "".join(wrapped) + "</div>"
 
-# --- Final UI (only render when final_df exists) ---
+
+# --- FINAL TRANSCRIPT VIEWER ---
 final_df = st.session_state.get("final_df", pd.DataFrame())
 
 if final_df.empty:
@@ -634,33 +634,39 @@ else:
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.markdown("## 🎛️ Transcript Browser")
 
-    # Controls: search, status, speaker, page size
-    col_a, col_b, col_c, col_d = st.columns([3,1,1,1])
+    # Controls: search, status, speaker filter, page size
+    col_a, col_b, col_c, col_d = st.columns([3, 1, 1, 1])
+
     with col_a:
         search_q = st.text_input("Search transcripts (text)", value="", placeholder="search across transcripts or phone")
+
     with col_b:
         status_sel = st.selectbox("Status", options=["All", "✅ Success", "❌ Error", "❌ Failed"], index=0)
+
     with col_c:
         speaker_sel = st.selectbox("Speaker filter", options=["All", "Speaker 1", "Speaker 2"], index=0)
+
     with col_d:
         per_page = st.selectbox("Per page", options=[5, 10, 20, 50], index=1)
 
     # Filtering pipeline
     view_df = final_df.copy()
 
-    # status filter
+    # --- Status filter ---
     if status_sel != "All":
         view_df = view_df[view_df["status"] == status_sel]
 
-    # search filter (search in transcript, mobile_number, recording_url)
-    if search_q and isinstance(search_q, str) and search_q.strip():
-        q = search_q.strip().lower()
-        mask = view_df["transcript"].fillna("").str.lower().str.contains(q) | \
-               view_df["mobile_number"].fillna("").astype(str).str.lower().str.contains(q) | \
-               view_df["recording_url"].fillna("").astype(str).str.lower().str.contains(q)
+    # --- Search filter ---
+    if search_q.strip():
+        q = search_q.lower()
+        mask = (
+            view_df["transcript"].fillna("").str.lower().str.contains(q)
+            | view_df["mobile_number"].astype(str).str.lower().str.contains(q)
+            | view_df["recording_url"].astype(str).str.lower().str.contains(q)
+        )
         view_df = view_df[mask]
 
-    # speaker presence filter: basic heuristic (lines contain Speaker 1 / Speaker 2)
+    # --- Speaker filter ---
     if speaker_sel != "All":
         key = "speaker 1" if speaker_sel == "Speaker 1" else "speaker 2"
         mask = view_df["transcript"].fillna("").str.lower().str.contains(key)
@@ -669,45 +675,52 @@ else:
     total_items = len(view_df)
     st.markdown(f"**Showing {total_items} result(s)**")
 
-    # Pagination
+    # --- Pagination ---
+    import math
     pages = max(1, math.ceil(total_items / per_page))
     page_idx = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1)
     start = (page_idx - 1) * per_page
     end = start + per_page
     page_df = view_df.iloc[start:end]
 
-    # Download filtered view as Excel
+    # --- Download current page ---
     out_buf = BytesIO()
     page_df.to_excel(out_buf, index=False)
-    st.download_button("📥 Download filtered results (current page)", data=out_buf.getvalue(),
-                       file_name=f"transcripts_page{page_idx}_{int(time.time())}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "📥 Download filtered results (current page)",
+        data=out_buf.getvalue(),
+        file_name=f"transcripts_page{page_idx}_{int(time.time())}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-    # Render each transcript as an expander card for long text handling
+    # --- Render each transcript as expandable card ---
     for idx, row in page_df.iterrows():
         header = f"{row.get('mobile_number','Unknown')} — {row.get('status','')}"
         with st.expander(header, expanded=False):
-            # meta row
+
+            # metadata block
             meta_html = "<div class='meta-row'>"
-            meta_html += f"URL: {st.escape(str(row.get('recording_url', '')))} &nbsp; | &nbsp; Status: {st.escape(str(row.get('status','')))}"
-            # include duration / any extra columns
+            meta_html += f"URL: {html.escape(str(row.get('recording_url', '')))}"
+            meta_html += f" &nbsp; | &nbsp; Status: {html.escape(str(row.get('status', '')))}"
+
+            # include extra original columns dynamically
             extra_meta = []
             for col in row.index:
                 if col not in ("mobile_number", "recording_url", "status", "transcript", "error"):
                     val = row.get(col)
-                    extra_meta.append(f"{st.escape(str(col))}: {st.escape(str(val))}")
+                    extra_meta.append(f"{html.escape(str(col))}: {html.escape(str(val))}")
+
             if extra_meta:
                 meta_html += " &nbsp; | &nbsp; " + " &nbsp; ".join(extra_meta)
+
             meta_html += "</div>"
+
             st.markdown(meta_html, unsafe_allow_html=True)
 
-            # transcript box (scrollable)
+            # transcript box
             transcript_html = colorize_transcript_html(row.get("transcript", ""))
             st.markdown(f"<div class='transcript-box'>{transcript_html}</div>", unsafe_allow_html=True)
 
-            # show error if present
+            # error display if present
             if row.get("error"):
                 st.error(f"Error: {row.get('error')}")
-
-    st.markdown("---")
-    st.caption("Tip: Use the search box to quickly find words or phone numbers. Use speaker filter to view only calls mentioning a speaker label.")
