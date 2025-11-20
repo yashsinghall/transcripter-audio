@@ -1,4 +1,4 @@
-# app.py  — PART 1/4
+# app.py — COMPLETE BATCH TRANSCRIBER
 # Core imports, config, network helpers, MIME detection, one-shot upload, polling, transcription API.
 
 import streamlit as st
@@ -12,6 +12,7 @@ import mimetypes
 import tempfile
 import random
 import math 
+import html
 from io import BytesIO
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,7 +21,9 @@ from typing import Optional, Dict, Any
 # --- CONFIG ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-MODEL_NAME = "gemini-2.5-flash"  # or "gemini-1.5-flash"
+# NOTE: "gemini-2.5-flash" is not a standard public endpoint yet. 
+# Using "gemini-1.5-flash" to ensure stability. Change back if you have specific access.
+MODEL_NAME = "gemini-1.5-flash" 
 
 # streaming download chunk size (upload is streaming one-shot)
 DOWNLOAD_CHUNK_SIZE = 8192
@@ -33,6 +36,63 @@ logging.basicConfig(
 )
 logger = logging.getLogger("transcriber")
 
+# --- UI STYLING (Full CSS) ---
+BASE_CSS = """
+<style>
+/* Card look */
+.call-card {
+    border: 1px solid var(--border-color, #e6e6e6);
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 12px;
+    background: var(--card-bg, #fff);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+
+/* Transcript scroll area */
+.transcript-box {
+    max-height: 320px;
+    overflow: auto;
+    padding: 8px;
+    border-radius: 6px;
+    background: var(--transcript-bg, #fafafa);
+    border: 1px solid var(--border-color, #eee);
+    font-family: monospace; /* Monospace helps alignment */
+    white-space: pre-wrap;  /* Preserves newlines */
+}
+
+/* Speaker colors */
+.speaker1 { color: #1f77b4; font-weight: 600; display: block; margin-bottom: 4px; }
+.speaker2 { color: #d62728; font-weight: 600; display: block; margin-bottom: 4px; }
+.other-speech { color: #333; display: block; margin-bottom: 4px; }
+
+/* compact meta row */
+.meta-row { font-size: 13px; color: var(--meta-color, #666); margin-bottom: 8px; }
+
+.dark-theme {
+    --card-bg: #0f1115;
+    --transcript-bg: #0b0c0f;
+    --border-color: #222428;
+    --meta-color: #9aa0a6;
+    color: #e6eef3;
+}
+.light-theme {
+    --card-bg: #ffffff;
+    --transcript-bg: #fafafa;
+    --border-color: #e6e6e6;
+    --meta-color: #666666;
+    color: #111;
+}
+
+/* small search box */
+.search-box { margin-bottom: 10px; padding: 6px; border-radius: 6px; border: 1px solid var(--border-color, #eee); width:100%; }
+</style>
+"""
+
+st.set_page_config(page_title="Batch Transcriber", layout="wide")
+st.markdown(BASE_CSS, unsafe_allow_html=True)
+
+
 # --- UTILITIES & NETWORK HELPERS ---
 
 def _sleep_with_jitter(base_seconds: float, attempt: int):
@@ -43,7 +103,6 @@ def _sleep_with_jitter(base_seconds: float, attempt: int):
 def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
     """
     Robust wrapper for requests with exponential backoff + jitter.
-    Re-raises the last exception if all retries fail.
     """
     last_exc = None
     for attempt in range(max_retries):
@@ -84,22 +143,30 @@ def detect_extension_and_mime(url_path: str, header_content_type: Optional[str])
     """
     _, ext = os.path.splitext(url_path or "")
     ext = ext.lower()
+    
+    # 1. Trust extension if it is a known audio type
     if ext and ext in COMMON_AUDIO_MIME:
         return ext, COMMON_AUDIO_MIME[ext]
-    # try header
+    
+    # 2. Try header
     if header_content_type:
         ctype = header_content_type.split(";")[0].strip()
-        guessed_ext = mimetypes.guess_extension(ctype) if ctype else None
+        # Reverse lookup map
+        for k, v in COMMON_AUDIO_MIME.items():
+            if v == ctype:
+                return k, ctype
+        
+        # Attempt standard guess
+        guessed_ext = mimetypes.guess_extension(ctype)
         if guessed_ext:
-            guessed_ext = guessed_ext.lower()
-            guessed_mime = ctype
-            return guessed_ext, guessed_mime
-        # fallback to raw header mime if unknown extension
-        return ".bin", ctype
-    # last fallback
+            return guessed_ext.lower(), ctype
+            
+    # 3. Last fallback: Default to MP3
+    # CRITICAL FIX: Google File API rejects unknown/bin types. 
+    # Forcing .mp3 usually works even if the container is slightly different.
     return ".mp3", "audio/mpeg"
 
-# --- UPLOAD PIPELINE (simple one-shot streaming upload — WORKING) ---
+# --- UPLOAD PIPELINE (simple one-shot streaming upload) ---
 
 def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: int) -> str:
     """
@@ -118,18 +185,15 @@ def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: 
     if resp.status_code not in (200, 201):
         logger.error("initiate_upload failed: %s %s", resp.status_code, resp.text)
         raise Exception(f"Init failed ({resp.status_code}): {resp.text}")
+    
     upload_url = resp.headers.get("X-Goog-Upload-URL")
     if not upload_url:
-        logger.error("No X-Goog-Upload-URL in response headers: %s", resp.headers)
         raise Exception("Failed to get upload URL from Google.")
-    logger.debug("Initiated resumable upload: %s", upload_url)
     return upload_url
 
 def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, Any]:
     """
-    Working one-shot streaming upload that streams file bytes and finalizes in one request.
-    Falls back to PUT if POST returns 400 on some server variants.
-    Returns file metadata dict on success.
+    Streams file bytes and finalizes in one request.
     """
     file_size = os.path.getsize(file_path)
     headers = {
@@ -163,7 +227,6 @@ def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, A
 def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 300) -> bool:
     """
     Poll until Google marks the file ACTIVE or FAILED.
-    Uses exponential backoff with cap.
     """
     url = f"{BASE_URL}/v1beta/{file_name}?key={api_key}"
     start = time.time()
@@ -182,17 +245,24 @@ def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 300) ->
                 return True
             if state == "FAILED":
                 raise Exception(f"File processing failed: {j.get('processingError', j)}")
+            
             attempt += 1
-            _sleep_with_jitter(1, attempt)
+            time.sleep(2) # Simple sleep for polling
 
         if time.time() - start > timeout_seconds:
             raise Exception("Timed out waiting for file to become ACTIVE.")
 
-# --- TRANSCRIPTION CALLS & RESPONSE VALIDATION ---
+def delete_file(api_key: str, file_name: str):
+    try:
+        requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
+    except Exception as e:
+        logger.warning("delete_file failed for %s: %s", file_name, str(e))
+
+# --- TRANSCRIPTION CALLS ---
 
 def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str) -> str:
     """
-    Calls Gemini generateContent for transcription. Returns the transcript text or structured error message.
+    Calls Gemini generateContent for transcription.
     """
     api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
 
@@ -233,28 +303,19 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         if prompt_feedback and prompt_feedback.get("blockReason"):
             return f"BLOCKED: {prompt_feedback.get('blockReason')}"
         return "NO TRANSCRIPT (Empty Response)"
+    
     first = candidates[0]
     content = first.get("content", {})
     parts = content.get("parts", [])
     if not parts:
         return "NO TRANSCRIPT (No parts in response)"
+    
     first_part = parts[0]
     text = first_part.get("text") or first_part.get("content") or ""
     return text
 
-def delete_file(api_key: str, file_name: str):
-    try:
-        requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
-    except Exception as e:
-        logger.warning("delete_file failed for %s: %s", file_name, str(e))
-# app.py — PART 2/4
-# Worker, prompt template, processing function, and result-collection/merging utilities.
-
-# --- DIARIZATION-ENFORCEMENT PROMPT ---
+# --- DIARIZATION-ENFORCEMENT PROMPT (YOUR EXACT PROMPT) ---
 def build_prompt(language_label: str) -> str:
-    """
-    Strong, enforced diarization prompt. Use build_prompt(lang_map[language_mode]).
-    """
     return f"""
 Transcribe this call in {language_label} exactly as spoken.
 
@@ -296,10 +357,6 @@ Return ONLY the transcript. No explanation.
 # --- WORKER / PROCESSING FUNCTION ---
 
 def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template: str, keep_remote: bool = False) -> Dict[str, Any]:
-    """
-    Processes a single row. Returns a dict with original index to allow stable ordering.
-    Downloads audio (streamed), uploads (one-shot streamed), polls, transcribes.
-    """
     mobile = str(row.get("mobile_number", "Unknown"))
     audio_url = row.get("recording_url")
     result = {
@@ -335,13 +392,11 @@ def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template
                     tmp.write(chunk)
             tmp_path = tmp.name
 
-        # Re-evaluate mime by extension mapping (explicit, do not transcode)
-        mime_type = COMMON_AUDIO_MIME.get(os.path.splitext(tmp_path)[1].lower(), mime_type or "audio/mpeg")
         file_size = os.path.getsize(tmp_path)
 
         # Prepare unique remote name (sanitized)
         cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
-        unique_name = f"rec_{cleaned_mobile}_{int(time.time())}{os.path.splitext(tmp_path)[1]}"
+        unique_name = f"rec_{cleaned_mobile}_{int(time.time())}{ext}"
 
         # 1) Initiate
         upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
@@ -359,6 +414,7 @@ def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template
         # 4) Generate transcript
         transcript = generate_transcript(api_key, file_info["uri"], mime_type, prompt_template)
         result["transcript"] = transcript
+        
         if transcript.startswith("API ERROR") or transcript.startswith("PARSE ERROR") or transcript.startswith("BLOCKED"):
             result["status"] = "❌ Error"
         else:
@@ -382,345 +438,240 @@ def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template
             try:
                 delete_file(api_key, file_info["name"])
             except Exception:
-                logger.warning("Failed to delete remote file %s", file_info.get("name"))
+                pass
 
     return result
 
 # --- RESULT MERGE UTILITIES ---
 
 def merge_results_with_original(df_original: pd.DataFrame, processed_results: list) -> pd.DataFrame:
-    """
-    Builds final DataFrame by merging processed results (which contain 'index') with original df columns.
-    Preserves order, merges extra original columns like 'duration'.
-    """
     results_df = pd.DataFrame(sorted(processed_results, key=lambda r: r["index"]))
-    orig_reset = df_original.reset_index()  # column 'index' aligns with results_df.index values
-    # Determine extra columns to merge (exclude 'index' and ones already present)
+    orig_reset = df_original.reset_index() # column 'index' aligns with results_df.index values
+    
     existing_cols = set(results_df.columns)
     extra_cols = [c for c in orig_reset.columns if c not in ("index",) and c not in existing_cols]
+    
     if extra_cols:
         merged = results_df.merge(orig_reset[["index"] + extra_cols], on="index", how="left")
     else:
         merged = results_df
-    # drop internal index column
+    
     if "index" in merged.columns:
         merged = merged.drop(columns=["index"])
     return merged
 
-# --- STREAMLIT PROCESSING ENTRYPOINT (keeps old UI start logic) ---
-# The actual UI and submission will be in Part 3; this file exposes the processing helper used by UI.
-# app.py — PART 3/4
-# Streamlit UI controls, processing loop, live preview + search/filter controls, and session state.
-
-# --- UI Helpers & Small CSS for modern look and scrolling transcripts ---
-BASE_CSS = """
-<style>
-/* Card look */
-.call-card {
-    border: 1px solid var(--border-color, #e6e6e6);
-    border-radius: 10px;
-    padding: 12px;
-    margin-bottom: 12px;
-    background: var(--card-bg, #fff);
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-}
-
-/* Transcript scroll area */
-.transcript-box {
-    max-height: 320px;
-    overflow: auto;
-    padding: 8px;
-    border-radius: 6px;
-    background: var(--transcript-bg, #fafafa);
-    border: 1px solid var(--border-color, #eee);
-}
-
-/* Speaker colors */
-.speaker1 { color: #1f77b4; font-weight: 600; }
-.speaker2 { color: #d62728; font-weight: 600; }
-.other-speech { color: #333; }
-
-/* compact meta row */
-.meta-row { font-size: 13px; color: var(--meta-color, #666); margin-bottom: 8px; }
-
-.dark-theme {
-    --card-bg: #0f1115;
-    --transcript-bg: #0b0c0f;
-    --border-color: #222428;
-    --meta-color: #9aa0a6;
-    color: #e6eef3;
-}
-.light-theme {
-    --card-bg: #ffffff;
-    --transcript-bg: #fafafa;
-    --border-color: #e6e6e6;
-    --meta-color: #666666;
-    color: #111;
-}
-
-/* small search box */
-.search-box { margin-bottom: 10px; padding: 6px; border-radius: 6px; border: 1px solid var(--border-color, #eee); width:100%; }
-</style>
-"""
-
-st.markdown(BASE_CSS, unsafe_allow_html=True)
-
-# --- Initialize session state containers ---
-if "processed_results" not in st.session_state:
-    st.session_state.processed_results = []
-
-if "final_df" not in st.session_state:
-    st.session_state.final_df = pd.DataFrame()
-
-if "orig_df" not in st.session_state:
-    st.session_state.orig_df = pd.DataFrame()
-
-# --- Sidebar: Config (keeps parity with previous layout) ---
-with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("Gemini API Key", type="password")
-    max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=8, value=4,
-                            help="Higher = faster but may hit API rate limits. Keep lower for large batches.")
-    keep_remote = st.checkbox("Keep audio on Google (do not auto-delete)", value=False,
-                              help="If you want to keep uploaded audio for debugging or reprocessing, enable this.")
-    st.divider()
-    language_mode = st.selectbox("Language", ["English (India)", "Hindi", "Mixed (Hinglish)"], index=2)
-    lang_map = {
-        "English (India)": "English (Indian accent)",
-        "Hindi": "Hindi (Devanagari)",
-        "Mixed (Hinglish)": "Mixed English and Hindi"
-    }
-    # Theme toggle
-    theme_choice = st.radio("Theme", options=["Light", "Dark"], index=0, horizontal=True)
-    st.caption("Use Dark theme if you prefer low-light UI.")
-
-# Main uploader + start
-uploaded_file = st.file_uploader("Upload Excel (.xlsx) with `recording_url` and optional columns (duration etc.)", type=["xlsx"])
-
-# Search and filter controls (apply after processing)
-col_search, col_filter = st.columns([2,1])
-with col_search:
-    global_search = st.text_input("Search transcripts (text)", placeholder="Search across transcripts...")
-with col_filter:
-    status_filter = st.selectbox("Status filter", options=["All", "✅ Success", "❌ Error", "❌ Failed"], index=0)
-
-start_button = st.button("🚀 Start Batch Processing", type="primary")
-
-# Live preview and processing placeholders
-progress_bar = st.empty()
-status_text = st.empty()
-result_placeholder = st.empty()
-live_preview_area = st.empty()
-
-# Apply theme class to body container
-theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
-st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
-
-# --- Start Processing Handler ---
-if start_button:
-    if not api_key or not uploaded_file:
-        st.error("Please enter API Key and upload a file containing 'recording_url' column.")
-        st.stop()
-
-    try:
-        df = pd.read_excel(uploaded_file)
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        st.stop()
-
-    if "recording_url" not in df.columns:
-        st.error("Column 'recording_url' is missing.")
-        st.stop()
-
-    # Save original df into session state so Part 4 can access it
-    st.session_state.orig_df = df.copy()
-
-    # Build prompt once (use build_prompt helper)
-    prompt_template = build_prompt(lang_map[language_mode])
-
-    total_rows = len(df)
-    progress_bar.progress(0.0)
-    status_text.info(f"Starting processing with {max_workers} threads...")
-
-    st.session_state.processed_results = []
-    processed_results = st.session_state.processed_results  # local ref for speed
-
-    # --- PARALLEL EXECUTION ---
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(process_single_row, idx, row, api_key, prompt_template, keep_remote): idx
-            for idx, row in df.iterrows()
-        }
-
-        completed = 0
-        for future in as_completed(futures):
-            res = future.result()
-            processed_results.append(res)
-            completed += 1
-            # update progress and status
-            progress_bar.progress(completed / total_rows)
-            status_text.markdown(f"Processed **{completed}/{total_rows}** files.")
-
-            # Live merged preview including extra original columns
-            live_results_df = pd.DataFrame(sorted(processed_results, key=lambda r: r["index"]))
-            orig_reset = df.reset_index()
-            extra_cols = [c for c in orig_reset.columns if c not in ("index", "recording_url", "mobile_number")]
-            if extra_cols:
-                preview_df = live_results_df.merge(orig_reset[["index"] + extra_cols], on="index", how="left")
-            else:
-                preview_df = live_results_df
-
-            # apply status filter if any
-            display_df = preview_df.copy()
-            if status_filter != "All":
-                display_df = display_df[display_df["status"] == status_filter]
-
-            # show the last N rows (5)
-            cols_to_show = ["mobile_number", "status", "transcript"] + extra_cols
-            # ensure cols exist
-            cols_to_show = [c for c in cols_to_show if c in display_df.columns]
-            result_placeholder.dataframe(display_df[cols_to_show].tail(5), width='stretch')
-
-           # After all done, merge fully into final_df and store in session_state for Part 4 (no forced rerun)
-            final_df = merge_results_with_original(df, st.session_state.processed_results)
-            st.session_state.final_df = final_df
-            st.session_state.processing_done = True  # flag to indicate processing finished
-
-            status_text.success("Batch Processing Complete!")
-            # Do not call st.experimental_rerun() — instead rely on session_state to render final UI below.
-            # Optionally give the user a direct button to jump to results
-            st.info("Processing finished. Scroll down to the Transcript Browser, or click the button below.")
-            if st.button("Show Results Now", key="show_results_btn"):
-                # no-op: pressing this will cause the app to re-run the script and show Part 4
-                pass
-    
-# Close theme wrapper
-st.markdown("</div>", unsafe_allow_html=True)
-# app.py — PART 4/4 (PATCHED & FIXED)
-# Final transcript rendering: expandable panels, search/filters, colored speaker view, pagination & download.
-
-import html  # required for safe escaping
-
-def _wrap_line_html(line: str) -> str:
-    """Return HTML-wrapped line with speaker color classes when label is present."""
-    clean = line.strip()
-
-    # detect speaker label at line start (case-insensitive)
-    lc = clean.lower()
-    if lc.startswith("speaker 1:"):
-        return f"<div class='speaker1'>{html.escape(clean)}</div>"
-    if lc.startswith("speaker 2:"):
-        return f"<div class='speaker2'>{html.escape(clean)}</div>"
-
-    # fallback
-    return f"<div class='other-speech'>{html.escape(clean)}</div>"
-
+# --- HTML FORMATTING FOR VIEWER ---
 def colorize_transcript_html(text: str) -> str:
     """Convert transcript text into HTML block with colored speaker lines and escaping."""
     if not isinstance(text, str) or not text.strip():
         return "<div class='other-speech'>No transcript</div>"
 
     lines = text.splitlines()
-    wrapped = [_wrap_line_html(ln) for ln in lines if ln.strip()]
-    return "<div>" + "".join(wrapped) + "</div>"
+    html_output = ""
+    
+    for line in lines:
+        clean = line.strip()
+        if not clean: continue
+        
+        escaped_line = html.escape(clean)
+        lc = clean.lower()
+        
+        if "speaker 1:" in lc:
+            html_output += f"<div class='speaker1'>{escaped_line}</div>"
+        elif "speaker 2:" in lc:
+            html_output += f"<div class='speaker2'>{escaped_line}</div>"
+        else:
+            html_output += f"<div class='other-speech'>{escaped_line}</div>"
+            
+    return f"<div>{html_output}</div>"
 
+# --- MAIN UI LOGIC ---
 
-# --- FINAL TRANSCRIPT VIEWER ---
-final_df = st.session_state.get("final_df", pd.DataFrame())
+def main():
+    # --- Initialize session state containers ---
+    if "processed_results" not in st.session_state:
+        st.session_state.processed_results = []
 
-if final_df.empty:
-    st.info("No processed transcripts to show yet. Upload and run processing to see results here.")
-else:
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("## 🎛️ Transcript Browser")
+    if "final_df" not in st.session_state:
+        st.session_state.final_df = pd.DataFrame()
 
-    # Controls: search, status, speaker filter, page size
-    col_a, col_b, col_c, col_d = st.columns([3, 1, 1, 1])
+    if "orig_df" not in st.session_state:
+        st.session_state.orig_df = pd.DataFrame()
 
-    with col_a:
-        search_q = st.text_input("Search transcripts (text)", value="", placeholder="search across transcripts or phone")
+    # --- Sidebar ---
+    with st.sidebar:
+        st.header("Configuration")
+        api_key = st.text_input("Gemini API Key", type="password")
+        max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=8, value=4,
+                                help="Higher = faster but may hit API rate limits.")
+        keep_remote = st.checkbox("Keep audio on Google", value=False,
+                                help="For debugging: prevents auto-deletion of files from Gemini.")
+        st.divider()
+        
+        language_mode = st.selectbox("Language", ["English (India)", "Hindi", "Mixed (Hinglish)"], index=2)
+        lang_map = {
+            "English (India)": "English (Indian accent)",
+            "Hindi": "Hindi (Devanagari)",
+            "Mixed (Hinglish)": "Mixed English and Hindi"
+        }
+        
+        theme_choice = st.radio("Theme", options=["Light", "Dark"], index=0, horizontal=True)
+        st.caption("Use Dark theme if you prefer low-light UI.")
 
-    with col_b:
-        status_sel = st.selectbox("Status", options=["All", "✅ Success", "❌ Error", "❌ Failed"], index=0)
+    # Set theme container class
+    theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
+    st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
 
-    with col_c:
-        speaker_sel = st.selectbox("Speaker filter", options=["All", "Speaker 1", "Speaker 2"], index=0)
+    uploaded_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 
-    with col_d:
-        per_page = st.selectbox("Per page", options=[5, 10, 20, 50], index=1)
+    # Placeholders for processing
+    progress_bar = st.empty()
+    status_text = st.empty()
+    result_placeholder = st.empty()
 
-    # Filtering pipeline
-    view_df = final_df.copy()
+    start_button = st.button("🚀 Start Batch Processing", type="primary")
 
-    # --- Status filter ---
-    if status_sel != "All":
-        view_df = view_df[view_df["status"] == status_sel]
+    # --- START PROCESSING ---
+    if start_button:
+        if not api_key or not uploaded_file:
+            st.error("Please enter API Key and upload a file.")
+            st.stop()
 
-    # --- Search filter ---
-    if search_q.strip():
-        q = search_q.lower()
-        mask = (
-            view_df["transcript"].fillna("").str.lower().str.contains(q)
-            | view_df["mobile_number"].astype(str).str.lower().str.contains(q)
-            | view_df["recording_url"].astype(str).str.lower().str.contains(q)
+        try:
+            df = pd.read_excel(uploaded_file)
+        except Exception as e:
+            st.error(f"Error reading file: {e}")
+            st.stop()
+
+        if "recording_url" not in df.columns:
+            st.error("Column 'recording_url' is missing.")
+            st.stop()
+
+        st.session_state.orig_df = df.copy()
+        prompt_template = build_prompt(lang_map[language_mode])
+        
+        total_rows = len(df)
+        progress_bar.progress(0.0)
+        status_text.info(f"Starting processing with {max_workers} threads...")
+
+        # Reset results
+        st.session_state.processed_results = []
+        processed_results = [] # Local list for loop
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(process_single_row, idx, row, api_key, prompt_template, keep_remote): idx
+                for idx, row in df.iterrows()
+            }
+
+            completed = 0
+            for future in as_completed(futures):
+                res = future.result()
+                processed_results.append(res)
+                completed += 1
+                
+                # Update progress
+                progress_bar.progress(completed / total_rows)
+                status_text.markdown(f"Processed **{completed}/{total_rows}** files.")
+                
+                # Live Preview - OPTIMIZED
+                # Only show the last 5 processed items to avoid O(N^2) merging lag
+                recent_results = sorted(processed_results, key=lambda r: r["index"])[-5:]
+                preview_df = pd.DataFrame(recent_results)
+                if not preview_df.empty:
+                    result_placeholder.dataframe(preview_df[["mobile_number", "status", "transcript"]], width=800)
+
+        # Final merge happens ONCE at the end
+        final_df = merge_results_with_original(df, processed_results)
+        st.session_state.final_df = final_df
+        st.session_state.processed_results = processed_results
+        
+        status_text.success("Batch Processing Complete!")
+
+    # --- RESULTS VIEWER (Part 4 Logic) ---
+    final_df = st.session_state.final_df
+
+    if not final_df.empty:
+        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown("## 🎛️ Transcript Browser")
+
+        col_a, col_b, col_c, col_d = st.columns([3, 1, 1, 1])
+        with col_a:
+            search_q = st.text_input("Search transcripts", value="", placeholder="Search text or phone...")
+        with col_b:
+            status_sel = st.selectbox("Status", options=["All", "✅ Success", "❌ Error", "❌ Failed"], index=0)
+        with col_c:
+            speaker_sel = st.selectbox("Speaker", options=["All", "Speaker 1", "Speaker 2"], index=0)
+        with col_d:
+            per_page = st.selectbox("Per page", options=[5, 10, 20, 50], index=1)
+
+        # Filter
+        view_df = final_df.copy()
+        if status_sel != "All":
+            view_df = view_df[view_df["status"] == status_sel]
+        
+        if search_q.strip():
+            q = search_q.lower()
+            mask = (
+                view_df["transcript"].fillna("").str.lower().str.contains(q) |
+                view_df["mobile_number"].astype(str).str.lower().str.contains(q) |
+                view_df["recording_url"].astype(str).str.lower().str.contains(q)
+            )
+            view_df = view_df[mask]
+
+        if speaker_sel != "All":
+            key = "speaker 1" if speaker_sel == "Speaker 1" else "speaker 2"
+            mask = view_df["transcript"].fillna("").str.lower().str.contains(key)
+            view_df = view_df[mask]
+
+        total_items = len(view_df)
+        st.markdown(f"**Showing {total_items} result(s)**")
+
+        # Pagination
+        pages = max(1, math.ceil(total_items / per_page))
+        page_idx = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1)
+        start = (page_idx - 1) * per_page
+        end = start + per_page
+        page_df = view_df.iloc[start:end]
+
+        # Download
+        out_buf = BytesIO()
+        view_df.to_excel(out_buf, index=False)
+        st.download_button(
+            "📥 Download Filtered Results",
+            data=out_buf.getvalue(),
+            file_name=f"transcripts_export_{int(time.time())}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        view_df = view_df[mask]
 
-    # --- Speaker filter ---
-    if speaker_sel != "All":
-        key = "speaker 1" if speaker_sel == "Speaker 1" else "speaker 2"
-        mask = view_df["transcript"].fillna("").str.lower().str.contains(key)
-        view_df = view_df[mask]
+        # Render Cards
+        for idx, row in page_df.iterrows():
+            header = f"{row.get('mobile_number','Unknown')} — {row.get('status','')}"
+            with st.expander(header, expanded=False):
+                # Meta
+                meta_html = "<div class='meta-row'>"
+                meta_html += f"URL: {html.escape(str(row.get('recording_url', '')))}"
+                
+                # Extra columns
+                extra_meta = []
+                for col in row.index:
+                    if col not in ("mobile_number", "recording_url", "status", "transcript", "error", "index"):
+                        val = row.get(col)
+                        extra_meta.append(f"{html.escape(str(col))}: {html.escape(str(val))}")
+                
+                if extra_meta:
+                    meta_html += " &nbsp; | &nbsp; " + " &nbsp; ".join(extra_meta)
+                meta_html += "</div>"
+                st.markdown(meta_html, unsafe_allow_html=True)
 
-    total_items = len(view_df)
-    st.markdown(f"**Showing {total_items} result(s)**")
+                # Transcript
+                transcript_html = colorize_transcript_html(row.get("transcript", ""))
+                st.markdown(f"<div class='transcript-box'>{transcript_html}</div>", unsafe_allow_html=True)
+                
+                if row.get("error"):
+                    st.error(f"Error: {row.get('error')}")
 
-    # --- Pagination ---
-    import math
-    pages = max(1, math.ceil(total_items / per_page))
-    page_idx = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1)
-    start = (page_idx - 1) * per_page
-    end = start + per_page
-    page_df = view_df.iloc[start:end]
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- Download current page ---
-    out_buf = BytesIO()
-    page_df.to_excel(out_buf, index=False)
-    st.download_button(
-        "📥 Download filtered results (current page)",
-        data=out_buf.getvalue(),
-        file_name=f"transcripts_page{page_idx}_{int(time.time())}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    # --- Render each transcript as expandable card ---
-    for idx, row in page_df.iterrows():
-        header = f"{row.get('mobile_number','Unknown')} — {row.get('status','')}"
-        with st.expander(header, expanded=False):
-
-            # metadata block
-            meta_html = "<div class='meta-row'>"
-            meta_html += f"URL: {html.escape(str(row.get('recording_url', '')))}"
-            meta_html += f" &nbsp; | &nbsp; Status: {html.escape(str(row.get('status', '')))}"
-
-            # include extra original columns dynamically
-            extra_meta = []
-            for col in row.index:
-                if col not in ("mobile_number", "recording_url", "status", "transcript", "error"):
-                    val = row.get(col)
-                    extra_meta.append(f"{html.escape(str(col))}: {html.escape(str(val))}")
-
-            if extra_meta:
-                meta_html += " &nbsp; | &nbsp; " + " &nbsp; ".join(extra_meta)
-
-            meta_html += "</div>"
-
-            st.markdown(meta_html, unsafe_allow_html=True)
-
-            # transcript box
-            transcript_html = colorize_transcript_html(row.get("transcript", ""))
-            st.markdown(f"<div class='transcript-box'>{transcript_html}</div>", unsafe_allow_html=True)
-
-            # error display if present
-            if row.get("error"):
-                st.error(f"Error: {row.get('error')}")
+if __name__ == "__main__":
+    main()
