@@ -580,13 +580,19 @@ if start_button:
             cols_to_show = [c for c in cols_to_show if c in display_df.columns]
             result_placeholder.dataframe(display_df[cols_to_show].tail(5), width='stretch')
 
-    # After all done, merge fully into final_df and store in session_state for Part 4
-    final_df = merge_results_with_original(df, st.session_state.processed_results)
-    st.session_state.final_df = final_df
+           # After all done, merge fully into final_df and store in session_state for Part 4 (no forced rerun)
+            final_df = merge_results_with_original(df, st.session_state.processed_results)
+            st.session_state.final_df = final_df
+            st.session_state.processing_done = True  # flag to indicate processing finished
 
-    status_text.success("Batch Processing Complete!")
-    st.experimental_rerun()  # rerun to show final UI (Part 4 will render full transcripts)
-
+            status_text.success("Batch Processing Complete!")
+            # Do not call st.experimental_rerun() — instead rely on session_state to render final UI below.
+            # Optionally give the user a direct button to jump to results
+            st.info("Processing finished. Scroll down to the Transcript Browser, or click the button below.")
+            if st.button("Show Results Now"):
+                # no-op: pressing this will cause the app to re-run the script and show Part 4
+                pass
+    
 # Close theme wrapper
 st.markdown("</div>", unsafe_allow_html=True)
 # app.py — PART 4/4
