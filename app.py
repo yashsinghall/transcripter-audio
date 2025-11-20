@@ -1,3 +1,4 @@
+# app_part1.py
 import streamlit as st
 import pandas as pd
 import requests
@@ -7,7 +8,6 @@ import time
 import logging
 import mimetypes
 import tempfile
-import math
 import random
 from io import BytesIO
 from urllib.parse import urlparse
@@ -19,7 +19,7 @@ BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 MODEL_NAME = "gemini-2.5-flash"  # or "gemini-1.5-flash"
 
-# chunk size for resumable upload (256 KB recommended; tune as needed)
+# chunk size for resumable upload (256 KB recommended; tune if needed)
 RESUMABLE_CHUNK_SIZE = 256 * 1024
 
 # Configure logging
@@ -40,7 +40,7 @@ def _sleep_with_jitter(base_seconds: float, attempt: int):
 def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
     """
     Robust wrapper for requests with exponential backoff + jitter.
-    Will re-raise the last exception if all retries fail.
+    Re-raises the last exception if all retries fail.
     """
     last_exc = None
     for attempt in range(max_retries):
@@ -59,7 +59,6 @@ def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff
     # all retries exhausted
     if last_exc:
         raise last_exc
-    # if we got here without exception, return last response or raise
     raise Exception("make_request_with_retry: retries exhausted without a response")
 
 # --- MIME & EXTENSION HANDLING ---
@@ -78,7 +77,7 @@ COMMON_AUDIO_MIME = {
 def detect_extension_and_mime(url_path: str, header_content_type: Optional[str]) -> (str, str):
     """
     Determine extension and mime type from URL path and header.
-    Prioritize path extension, else header, else sane default.
+    Prioritize path extension, else header, else default.
     """
     _, ext = os.path.splitext(url_path or "")
     ext = ext.lower()
@@ -86,9 +85,8 @@ def detect_extension_and_mime(url_path: str, header_content_type: Optional[str])
         return ext, COMMON_AUDIO_MIME[ext]
     # try header
     if header_content_type:
-        # sometimes header includes charset; split
         ctype = header_content_type.split(";")[0].strip()
-        guessed_ext = mimetypes.guess_extension(ctype)
+        guessed_ext = mimetypes.guess_extension(ctype) if ctype else None
         if guessed_ext:
             guessed_ext = guessed_ext.lower()
             guessed_mime = ctype
@@ -126,8 +124,8 @@ def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: 
 
 def _get_remote_offset(upload_url: str) -> int:
     """
-    Query the upload URL to learn current committed offset. Returns integer offset.
-    Uses a zero-byte PUT with special headers to get Range/Offset from server, or relies on 'Range' header in 308.
+    Query upload session. If server responds 308 with Range header, return offset.
+    Otherwise return 0 (start). Never return -1.
     """
     try:
         headers = {
@@ -135,38 +133,34 @@ def _get_remote_offset(upload_url: str) -> int:
             "X-Goog-Upload-Command": "query"
         }
         resp = make_request_with_retry("PUT", upload_url, headers=headers, data=b"")
-        # Some servers may return 308 and include Range: bytes=0-12345 (last committed)
-        if resp.status_code in (200, 201):
-            # fully committed; offset == total size, but we cannot infer total here; return 0 sentinel
-            return -1
-        range_hdr = resp.headers.get("Range") or resp.headers.get("x-goog-upload-range")
-        if range_hdr:
-            # format "bytes=0-12345"
-            try:
-                s = range_hdr.split("=")[1].split("-")[1]
-                return int(s) + 1
-            except Exception:
-                pass
-        # fallback: no offset known, return 0
+        # If server responds 308 with Range header, parse it.
+        if resp.status_code == 308:
+            range_hdr = resp.headers.get("Range") or resp.headers.get("x-goog-upload-range")
+            if range_hdr:
+                try:
+                    # format "bytes=0-12345"
+                    committed_end = int(range_hdr.split("=")[1].split("-")[1])
+                    return committed_end + 1
+                except Exception:
+                    return 0
+            return 0
+        # If server returns 200/201 but no Range, assume 0 (fresh session). Do not treat as finalized.
         return 0
     except Exception:
-        # If query isn't supported, fallback to 0
+        # If query isn't supported or fails, fallback to 0
         return 0
 
 def upload_resumable_chunks(upload_url: str, file_path: str, chunk_size: int = RESUMABLE_CHUNK_SIZE) -> Dict[str, Any]:
     """
     Upload file in chunks to the upload_url using PUT with Content-Range.
+    Streams chunks from disk; never loads whole file into RAM.
     Returns parsed JSON metadata from the server on success.
-    This function streams chunks from disk and never loads the whole file into RAM.
     """
     total_size = os.path.getsize(file_path)
     logger.info("Starting chunked upload: %s (%d bytes)", os.path.basename(file_path), total_size)
 
-    # start offset (try to query remote)
+    # start offset (0 if none)
     offset = _get_remote_offset(upload_url)
-    if offset == -1:
-        # remote claims "done" — attempt to GET metadata via the file resource instead; but here return error
-        raise Exception("Upload already finalized on server (unexpected).")
 
     with open(file_path, "rb") as fh:
         fh.seek(offset)
@@ -187,18 +181,15 @@ def upload_resumable_chunks(upload_url: str, file_path: str, chunk_size: int = R
                 "X-Goog-Upload-Header-Content-Type": "application/octet-stream",
                 "Content-Range": content_range,
             }
-
             try:
-                # We use PUT for chunk upload (Google supports PUT with Content-Range)
+                # Use PUT for chunk upload (Google supports PUT with Content-Range)
                 resp = make_request_with_retry("PUT", upload_url, headers=headers, data=chunk)
             except Exception as e:
                 logger.warning("Chunk upload failed at offset %d: %s", offset, str(e))
-                # attempt a few times locally before aborting
                 attempt += 1
                 if attempt >= 5:
                     raise
                 _sleep_with_jitter(0.5, attempt)
-                # reposition file handle and retry reading the same chunk
                 fh.seek(offset)
                 continue
 
@@ -210,12 +201,12 @@ def upload_resumable_chunks(upload_url: str, file_path: str, chunk_size: int = R
                     return resp.json().get("file", resp.json())
                 except ValueError:
                     raise Exception("Upload finished but server returned non-JSON response.")
-            elif resp.status_code in (308,):  # Resume Incomplete (308)
-                # parse returned Range header to determine committed bytes
-                range_hdr = resp.headers.get("Range")
+            elif resp.status_code == 308:
+                # Resume Incomplete: parse Range header to determine committed bytes
+                range_hdr = resp.headers.get("Range") or resp.headers.get("x-goog-upload-range")
                 if range_hdr:
                     try:
-                        committed_end = int(range_hdr.split("-")[1])
+                        committed_end = int(range_hdr.split("=")[1].split("-")[1])
                         offset = committed_end + 1
                         fh.seek(offset)
                         logger.debug("Server acknowledged up to %d. Continuing from %d.", committed_end, offset)
@@ -246,11 +237,9 @@ def upload_resumable_chunks(upload_url: str, file_path: str, chunk_size: int = R
 
 def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, Any]:
     """
-    High-level upload function.
-    Streams the file in chunks and handles server responses.
+    High-level upload function. Streams the file in chunks and handles server responses.
     Returns file metadata dict on success.
     """
-    # Use resumable chunked upload (safer for large files and concurrency)
     return upload_resumable_chunks(upload_url, file_path, chunk_size=RESUMABLE_CHUNK_SIZE)
 
 # --- GOOGLE FILE STATUS POLLING ---
@@ -277,7 +266,6 @@ def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 300) ->
                 return True
             if state == "FAILED":
                 raise Exception(f"File processing failed: {j.get('processingError', j)}")
-            # else still processing
             attempt += 1
             _sleep_with_jitter(1, attempt)
 
@@ -289,7 +277,6 @@ def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 300) ->
 def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str) -> str:
     api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
 
-    # safetySettings left as in original but still validated server-side
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -321,14 +308,12 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
     except ValueError:
         return "PARSE ERROR: Non-JSON response from transcription API."
 
-    # Structured checks
     candidates = body.get("candidates") or []
     if not candidates:
         prompt_feedback = body.get("promptFeedback", {})
         if prompt_feedback and prompt_feedback.get("blockReason"):
             return f"BLOCKED: {prompt_feedback.get('blockReason')}"
         return "NO TRANSCRIPT (Empty Response)"
-    # Safely access nested keys
     first = candidates[0]
     content = first.get("content", {})
     parts = content.get("parts", [])
@@ -343,8 +328,8 @@ def delete_file(api_key: str, file_name: str):
         requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
     except Exception as e:
         logger.warning("delete_file failed for %s: %s", file_name, str(e))
-
-# --- WORKER (safe, streaming, ordered output) ---
+# app_part2.py
+# import the functions above or combine both parts into a single file when you paste
 
 def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template: str, keep_remote: bool = False) -> Dict[str, Any]:
     """
@@ -511,7 +496,7 @@ Requirements:
             # Show last 5 results
             live_df = pd.DataFrame(sorted(processed_results, key=lambda r: r["index"]))
             result_placeholder.dataframe(live_df[["mobile_number", "status", "transcript"]].tail(5),
-                                         use_container_width=True)
+                                         width='stretch')
 
     # final assembly & stable ordering by original index
     final_df = pd.DataFrame(sorted(processed_results, key=lambda r: r["index"]))
@@ -519,7 +504,7 @@ Requirements:
 
     st.success("Batch Processing Complete!")
     st.subheader("Final Results")
-    st.dataframe(final_df, use_container_width=True)
+    st.dataframe(final_df, width='stretch')
 
     # Offer download (same as before)
     output = BytesIO()
